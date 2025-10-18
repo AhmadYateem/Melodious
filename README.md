@@ -33,8 +33,8 @@ This project implements a custom YOLO-style object detector for Optical Music Re
 
 ### 3. Training (Optional)
 - If you want to retrain the model from scratch:
-  - Use the scripts in `melodious/train.py` (advanced users only)
-  - Make sure the dataset is available in `dataset_ds2_dense/`
+  - Use the scripts in `melodious/train.py` 
+  - Make sure the dataset is available in `dataset_ds2_dense/` (I did not upload it since it's large, you can download it from https://zenodo.org/records/4012193/files/ds2_dense.tar.gz?download=1).
 
 ### 4. Outputs
 - Visualizations and results are saved in `outputs/visualizations/`.
@@ -44,13 +44,3 @@ This project implements a custom YOLO-style object detector for Optical Music Re
 - A YOLO-style detector for 15 classes of musical symbols
 - Trained on dense, real-world sheet music images
 - Handles tiny, overlapping, and visually similar symbols
-
-## What to Show the Professor
-- **The main notebook (`model_evaluation.ipynb`) is the key deliverable.**
-- It contains:
-  - All code for loading, evaluating, and visualizing the model
-  - Plots and images demonstrating model performance
-  - Explanations of results and key findings
-
-## Questions?
-If you have any issues or questions, please check the notebook for detailed comments and explanations, or contact the project author.
