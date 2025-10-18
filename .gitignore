@@ -1,0 +1,11 @@
+# Ignore dataset and outputs
+/dataset_ds2_dense/
+/outputs/
+/logs/
+# Ignore virtual environments
+.venv/
+# Ignore Python cache
+__pycache__/
+*.pyc
+# Ignore Jupyter notebook checkpoints
+.ipynb_checkpoints/
