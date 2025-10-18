@@ -9,3 +9,4 @@ __pycache__/
 *.pyc
 # Ignore Jupyter notebook checkpoints
 .ipynb_checkpoints/
+dataset_ds2_dense/
