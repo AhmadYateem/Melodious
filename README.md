@@ -9,6 +9,18 @@ This project implements a custom YOLO-style object detector for Optical Music Re
 - **outputs/**: Stores training history, model checkpoints, and generated visualizations.
 - **dataset_ds2_dense/**: Contains the DeepScores v2 Dense dataset (images and annotations).
 
+## Project Flow
+- Dataset → Dataloaders: `melodious/dataset.py`
+  - `DeepScoresDataset` loads images/annotations and prepares targets.
+  - `create_dataloaders(...)` builds train/val `DataLoader`s with a clear `collate_fn`.
+- Model: `melodious/model.py`
+  - `create_yolo_model(...)` constructs a scratch YOLO model and places it on the chosen device.
+- Training: `melodious/train.py`
+  - `Trainer` wraps the loop, loss, metrics, checkpoints, TensorBoard, and plots.
+  - Run via `python main.py` (uses the functions above, no code duplication).
+- Inference: `melodious/inference.py`
+  - `load_model(...)`, `run_inference(...)`, and `batch_inference(...)` for evaluation/visualization.
+
 ## How to Use This Project
 
 ### 1. Environment Setup
@@ -30,6 +42,12 @@ This project implements a custom YOLO-style object detector for Optical Music Re
 
 - **You do NOT need to run `main.py` for evaluation.**
   - `main.py` is for custom scripts or additional experiments, but all core results and analysis are in the notebook.
+
+### Quick Commands
+- Train from scratch (subset):
+  - `python main.py --dataset dataset_ds2_dense --epochs 10 --batch-size 4 --img-size 640`
+- Inference on a single image (example):
+  - See `melodious/inference.py` → `load_model(...)` then `run_inference(...)`.
 
 ### 3. Training (Optional)
 - If you want to retrain the model from scratch:
