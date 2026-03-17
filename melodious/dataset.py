@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import numpy as np
 import cv2
@@ -248,27 +248,30 @@ class DeepScoresDataset(Dataset):
             'boxes': boxes,
             'labels': labels,
             'image_id': ann['image_id'],
-            'orig_size': (orig_w, orig_h)
+            'orig_size': (orig_w, orig_h),
+            'img_size': (self.img_size, self.img_size)
         }
         
         return image, target
 
 
-def collate_fn(batch):
+def collate_fn(batch: List[Tuple[torch.Tensor, Dict]]) -> Tuple[torch.Tensor, List[Dict]]:
     """
     Custom collate function for DataLoader.
-    Handles variable number of boxes per image.
+
+    - Stacks images into a tensor of shape (B, 3, H, W)
+    - Leaves targets as a list of dicts to support variable numbers of boxes
     """
-    images = []
-    targets = []
-    
+    images: List[torch.Tensor] = []
+    targets: List[Dict] = []
+
     for img, target in batch:
         images.append(img)
         targets.append(target)
-    
-    images = torch.stack(images, 0)
-    
-    return images, targets
+
+    images_tensor = torch.stack(images, 0)
+
+    return images_tensor, targets
 
 
 def create_dataloaders(
@@ -278,7 +281,7 @@ def create_dataloaders(
     num_workers: int = 2,
     max_train_samples: Optional[int] = 100,
     max_val_samples: Optional[int] = 20
-):
+) -> Tuple[DataLoader, DataLoader]:
     """
     Create train and validation dataloaders.
     
@@ -310,7 +313,7 @@ def create_dataloaders(
         augment=False
     )
     
-    train_loader = torch.utils.data.DataLoader(
+    train_loader: DataLoader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
@@ -318,8 +321,8 @@ def create_dataloaders(
         collate_fn=collate_fn,
         pin_memory=True
     )
-    
-    val_loader = torch.utils.data.DataLoader(
+
+    val_loader: DataLoader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
