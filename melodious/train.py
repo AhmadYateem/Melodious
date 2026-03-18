@@ -3,7 +3,7 @@ Training script for YOLO detector on DeepScores dataset.
 
 Implements loss functions, metrics, and training loop for music notation detection.
 Model is trained from scratch without pretrained weights.
-"""
+""" 
 
 import os
 import time
@@ -23,20 +23,46 @@ from .model import YOLODetector
 from .dataset import create_dataloaders, NUM_CLASSES
 
 
+class FocalLoss(nn.Module):
+    """Focal loss for handling class imbalance."""
+    
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = 'mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute focal loss."""
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
+
 class YOLOLoss(nn.Module):
     """
-    YOLO loss function combining:
-    - Localization loss (bbox coordinates)
-    - Confidence loss (objectness)
-    - Classification loss (symbol classes)
+    Improved YOLO loss function with:
+    - Focal loss for class imbalance
+    - CIoU loss for bounding box regression
+    - Better target matching
     """
     
-    def __init__(self, num_classes: int):
+    def __init__(self, num_classes: int, use_focal: bool = True):
         super().__init__()
         self.num_classes = num_classes
-        self.mse_loss = nn.MSELoss(reduction='sum')
-        self.bce_loss = nn.BCEWithLogitsLoss(reduction='sum')
-        self.ce_loss = nn.CrossEntropyLoss(reduction='sum')
+        self.use_focal = use_focal
+        
+        # Loss functions
+        self.mse_loss = nn.MSELoss(reduction='none')
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.focal_loss = FocalLoss(alpha=0.25, gamma=2.0) if use_focal else None
+        self.ce_loss = nn.CrossEntropyLoss(reduction='none')
         
         # Loss weights
         self.lambda_coord = 5.0
@@ -44,16 +70,75 @@ class YOLOLoss(nn.Module):
         self.lambda_obj = 1.0
         self.lambda_class = 1.0
     
+    def compute_ciou(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> torch.Tensor:
+        """Compute CIoU loss for better bbox regression."""
+        # pred_boxes: [N, 4] in cxcywh format
+        # target_boxes: [N, 4] in cxcywh format
+        
+        # Convert to xyxy
+        pred_x1 = pred_boxes[:, 0] - pred_boxes[:, 2] / 2
+        pred_y1 = pred_boxes[:, 1] - pred_boxes[:, 3] / 2
+        pred_x2 = pred_boxes[:, 0] + pred_boxes[:, 2] / 2
+        pred_y2 = pred_boxes[:, 1] + pred_boxes[:, 3] / 2
+        
+        target_x1 = target_boxes[:, 0] - target_boxes[:, 2] / 2
+        target_y1 = target_boxes[:, 1] - target_boxes[:, 3] / 2
+        target_x2 = target_boxes[:, 0] + target_boxes[:, 2] / 2
+        target_y2 = target_boxes[:, 1] + target_boxes[:, 3] / 2
+        
+        # Intersection
+        inter_x1 = torch.max(pred_x1, target_x1)
+        inter_y1 = torch.max(pred_y1, target_y1)
+        inter_x2 = torch.min(pred_x2, target_x2)
+        inter_y2 = torch.min(pred_y2, target_y2)
+        
+        inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+        
+        # Union
+        pred_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1)
+        target_area = (target_x2 - target_x1) * (target_y2 - target_y1)
+        union_area = pred_area + target_area - inter_area
+        
+        iou = inter_area / (union_area + 1e-6)
+        
+        # Center distance
+        pred_cx = pred_boxes[:, 0]
+        pred_cy = pred_boxes[:, 1]
+        target_cx = target_boxes[:, 0]
+        target_cy = target_boxes[:, 1]
+        
+        center_dist_sq = (pred_cx - target_cx) ** 2 + (pred_cy - target_cy) ** 2
+        
+        # Diagonal of smallest enclosing box
+        c_x1 = torch.min(pred_x1, target_x1)
+        c_y1 = torch.min(pred_y1, target_y1)
+        c_x2 = torch.max(pred_x2, target_x2)
+        c_y2 = torch.max(pred_y2, target_y2)
+        
+        c_sq = (c_x2 - c_x1) ** 2 + (c_y2 - c_y1) ** 2
+        
+        # Aspect ratio penalty
+        pred_w = pred_boxes[:, 2]
+        pred_h = pred_boxes[:, 3]
+        target_w = target_boxes[:, 2]
+        target_h = target_boxes[:, 3]
+        
+        ar_pred = pred_w / (pred_h + 1e-6)
+        ar_target = target_w / (target_h + 1e-6)
+        
+        v = (4 / (3.14159 ** 2)) * (torch.atan(ar_target) - torch.atan(ar_pred)) ** 2
+        alpha = v / (1 - iou + v + 1e-6)
+        
+        ciou = iou - center_dist_sq / (c_sq + 1e-6) - alpha * v
+        
+        return 1 - ciou  # Return loss (1 - CIoU)
+    
     def forward(self, predictions: List[torch.Tensor], targets: List[Dict]) -> Dict[str, torch.Tensor]:
         """
-        Compute loss between predictions and ground truth.
+        Compute loss with proper grid-based target matching.
         
-        Args:
-            predictions: List of prediction tensors at different scales
-            targets: List of target dicts with 'boxes' and 'labels'
-        
-        Returns:
-            Dict with total loss and component losses
+        Key insight: YOLO predictions are anchored to grid cells.
+        Each grid cell is responsible for predicting objects whose center falls in that cell.
         """
         device = predictions[0].device
         batch_size = predictions[0].size(0)
@@ -65,47 +150,138 @@ class YOLOLoss(nn.Module):
         
         num_pos = 0
         
-        # Simplified loss computation for prototype
-        # In full implementation, this would match predictions to targets using IoU
-        for pred in predictions:
-            # Flatten predictions
-            pred_flat = pred.view(batch_size, -1, 5 + self.num_classes)
+        for scale_idx, pred in enumerate(predictions):
+            # pred shape: (B, num_anchors, H, W, 5 + num_classes)
+            num_anchors = pred.size(1)
+            grid_h = pred.size(2)
+            grid_w = pred.size(3)
+            
+            # Create grid
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(grid_h, device=device, dtype=torch.float32),
+                torch.arange(grid_w, device=device, dtype=torch.float32),
+                indexing='ij'
+            )
             
             for b in range(batch_size):
                 target = targets[b]
+                target_boxes = target['boxes'].to(device)
+                target_labels = target['labels'].to(device)
                 
-                if len(target['boxes']) > 0:
-                    # Compute objectness loss (simplified)
-                    obj_scores = pred_flat[b, :, 4]
-                    obj_target = torch.zeros_like(obj_scores)
+                # Get predictions for this batch
+                pred_b = pred[b]  # (num_anchors, H, W, 5 + num_classes)
+                
+                # Create target tensor for objectness
+                obj_target = torch.zeros(num_anchors, grid_h, grid_w, device=device)
+                coord_target = torch.zeros(num_anchors, grid_h, grid_w, 4, device=device)
+                class_target = torch.zeros(num_anchors, grid_h, grid_w, self.num_classes, device=device)
+                
+                if len(target_boxes) == 0:
+                    # No objects - all predictions are negative
+                    obj_scores = pred_b[..., 4]
+                    loss_conf += self.bce_loss(obj_scores, obj_target).sum()
+                    continue
+                
+                # Normalize target boxes to grid coordinates
+                img_h, img_w = target.get('img_size', (640, 640))
+                if isinstance(img_h, int):
+                    img_h = float(img_h)
+                    img_w = float(img_w)
+                
+                for t_idx in range(len(target_boxes)):
+                    t_box = target_boxes[t_idx]  # [x1, y1, x2, y2] in pixel coords
                     
-                    # Mark some predictions as positive (simplified matching)
-                    num_targets = min(len(target['boxes']), pred_flat.size(1))
-                    if num_targets > 0:
-                        obj_target[:num_targets] = 1.0
-                        num_pos += num_targets
-                        
-                        # Coordinate loss for positive samples
-                        loss_coord += self.mse_loss(
-                            pred_flat[b, :num_targets, :4],
-                            torch.zeros_like(pred_flat[b, :num_targets, :4])  # Simplified
-                        )
-                        
-                        # Classification loss for positive samples
-                        loss_class += self.ce_loss(
-                            pred_flat[b, :num_targets, 5:],
-                            target['labels'][:num_targets].to(device)
-                        )
+                    # Convert to center format and normalize to grid
+                    t_cx = (t_box[0] + t_box[2]) / 2.0
+                    t_cy = (t_box[1] + t_box[3]) / 2.0
+                    t_w = t_box[2] - t_box[0]
+                    t_h = t_box[3] - t_box[1]
                     
-                    # Confidence loss
-                    loss_conf += self.bce_loss(obj_scores, obj_target)
+                    # Convert to grid coordinates
+                    gx = t_cx / img_w * grid_w  # Grid x position (float)
+                    gy = t_cy / img_h * grid_h  # Grid y position (float)
+                    
+                    # Grid cell indices
+                    gi = int(gx)
+                    gj = int(gy)
+                    
+                    # Clamp to valid range
+                    gi = max(0, min(grid_w - 1, gi))
+                    gj = max(0, min(grid_h - 1, gj))
+                    
+                    # Assign to first anchor (simplified - could use IoU-based anchor selection)
+                    for anchor_idx in range(num_anchors):
+                        if obj_target[anchor_idx, gj, gi] == 0:
+                            obj_target[anchor_idx, gj, gi] = 1.0
+                            num_pos += 1
+                            
+                            # Target coordinates in YOLO format (offsets from grid cell)
+                            # tx = gx - gi (offset within cell)
+                            # ty = gy - gj (offset within cell)
+                            # tw = log(w / anchor_w) - simplified: log(w / img_w)
+                            # th = log(h / anchor_h) - simplified: log(h / img_h)
+                            
+                            tw_norm = t_w / img_w
+                            th_norm = t_h / img_h
+                            
+                            coord_target[anchor_idx, gj, gi] = torch.tensor([
+                                gx - gi,  # tx
+                                gy - gj,  # ty
+                                torch.log(torch.tensor(tw_norm + 1e-6)),  # tw
+                                torch.log(torch.tensor(th_norm + 1e-6))   # th
+                            ], device=device)
+                            
+                            # Class target (one-hot)
+                            class_target[anchor_idx, gj, gi, target_labels[t_idx]] = 1.0
+                            break
+                
+                # Compute losses for this batch and scale
+                # Objectness loss
+                obj_scores = pred_b[..., 4]
+                loss_conf += self.bce_loss(obj_scores, obj_target).sum()
+                
+                # Coordinate loss (only for positive cells)
+                pos_mask = obj_target > 0
+                if pos_mask.sum() > 0:
+                    # Get predictions for positive cells
+                    pred_coords = pred_b[..., :4]  # (num_anchors, H, W, 4)
+                    
+                    # Match training to the decoder, which applies sigmoid to cell offsets.
+                    pred_tx = pred_coords[..., 0][pos_mask]
+                    pred_ty = pred_coords[..., 1][pos_mask]
+                    target_tx = coord_target[..., 0][pos_mask]
+                    target_ty = coord_target[..., 1][pos_mask]
+                    
+                    loss_coord += self.mse_loss(torch.sigmoid(pred_tx), target_tx).sum()
+                    loss_coord += self.mse_loss(torch.sigmoid(pred_ty), target_ty).sum()
+                    
+                    # Compute loss for w, h (log scale)
+                    pred_tw = pred_coords[..., 2][pos_mask]
+                    pred_th = pred_coords[..., 3][pos_mask]
+                    target_tw = coord_target[..., 2][pos_mask]
+                    target_th = coord_target[..., 3][pos_mask]
+                    
+                    loss_coord += self.mse_loss(pred_tw, target_tw).sum()
+                    loss_coord += self.mse_loss(pred_th, target_th).sum()
+                    
+                    # Classification loss
+                    pred_cls = pred_b[..., 5:][pos_mask]  # (N, num_classes)
+                    target_cls = class_target[pos_mask]   # (N, num_classes)
+                    
+                    if self.use_focal and len(target_cls) > 0:
+                        # For focal loss, we need class indices
+                        target_cls_idx = target_cls.argmax(dim=1)
+                        loss_class += self.focal_loss(pred_cls, target_cls_idx)
+                    elif len(target_cls) > 0:
+                        target_cls_idx = target_cls.argmax(dim=1)
+                        loss_class += self.ce_loss(pred_cls, target_cls_idx).sum()
         
         # Normalize losses
         if num_pos > 0:
             loss_coord = loss_coord / num_pos
             loss_class = loss_class / num_pos
         
-        loss_conf = loss_conf / (batch_size * 3)  # 3 scales
+        loss_conf = loss_conf / (batch_size * len(predictions))
         
         # Weighted total loss
         total_loss = (
@@ -231,14 +407,14 @@ class Metrics:
                 if best_iou >= 0.5 and class_match and best_idx not in matched_050:
                     metrics['detection_050']['tp'] += 1
                     matched_050.add(best_idx)
-                elif best_iou >= 0.5 or best_iou >= 0.25:
+                else:
                     metrics['detection_050']['fp'] += 1
                 
                 # IoU 0.75 (strict)
                 if best_iou >= 0.75 and class_match and best_idx not in matched_075:
                     metrics['detection_075']['tp'] += 1
                     matched_075.add(best_idx)
-                elif best_iou >= 0.75 or best_iou >= 0.5:
+                else:
                     metrics['detection_075']['fp'] += 1
             
             # Count false negatives (unmatched targets)
@@ -332,10 +508,15 @@ class Trainer:
         
         # Loss and optimizer
         self.criterion = YOLOLoss(num_classes=NUM_CLASSES)
-        self.optimizer = optim.Adam(model.parameters(), lr=lr)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=2
+        self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+        
+        # Cosine annealing scheduler for better convergence
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=num_epochs, eta_min=lr * 0.01
         )
+        
+        # Gradient clipping value
+        self.grad_clip = 1.0
         
         # Tensorboard
         self.writer = SummaryWriter(log_dir=str(self.log_dir / 'tensorboard'))
@@ -368,6 +549,10 @@ class Trainer:
             # Backward pass
             self.optimizer.zero_grad()
             losses['total'].backward()
+            
+            # Gradient clipping for stability
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+            
             self.optimizer.step()
             
             # Update metrics
@@ -395,12 +580,17 @@ class Trainer:
     
     @torch.no_grad()
     def validate(self, epoch: int) -> Tuple[float, Dict]:
-        """Validate model."""
+        """Validate model with ACTUAL detection metrics."""
         self.model.eval()
         val_loss = 0.0
         val_coord_loss = 0.0
         val_conf_loss = 0.0
         val_class_loss = 0.0
+        
+        # Collect predictions and targets for ACTUAL metrics
+        all_predictions = []
+        all_targets = []
+        all_confidences = []  # Track confidence scores
         
         pbar = tqdm(self.val_loader, desc=f'Epoch {epoch+1}/{self.num_epochs} [VAL]  ', 
                    ncols=120, colour='blue')
@@ -418,6 +608,17 @@ class Trainer:
             val_conf_loss += losses['conf'].item()
             val_class_loss += losses['class'].item()
             
+            # Get actual detections for metrics (pass img_size from dataset)
+            img_size = images.shape[-1]  # Assume square images
+            detections = self.model.get_detections(predictions, conf_thresh=0.3, img_size=img_size)
+            all_predictions.extend(detections)
+            all_targets.extend(targets)
+            
+            # Collect confidence scores
+            for det in detections:
+                if len(det['scores']) > 0:
+                    all_confidences.extend(det['scores'].cpu().numpy().tolist())
+            
             pbar.set_postfix(
                 loss=f"{batch_loss:.4f}",
                 coord=f"{losses['coord'].item():.3f}",
@@ -431,24 +632,24 @@ class Trainer:
         avg_conf_loss = val_conf_loss / n_batches
         avg_class_loss = val_class_loss / n_batches
         
-        # For now, use loss-based proxy metrics until model converges better
-        # As loss decreases, these will improve
-        relative_improvement = 1.0 - (avg_loss / (self.history['val_loss'][0] if self.history['val_loss'] else avg_loss + 1000))
-        proxy_precision = max(0.0, min(0.95, relative_improvement * 0.8))
-        proxy_recall = max(0.0, min(0.90, relative_improvement * 0.75))
-        proxy_f1 = 2 * proxy_precision * proxy_recall / (proxy_precision + proxy_recall + 1e-6) if (proxy_precision + proxy_recall) > 0 else 0.0
+        # Compute ACTUAL detection metrics (not proxy!)
+        metrics = Metrics.compute_metrics(all_predictions, all_targets)
         
-        metrics = {
-            'precision': proxy_precision,
-            'recall': proxy_recall,
-            'f1': proxy_f1,
-            'tp': int(proxy_recall * 1000),  # Proxy values
-            'fp': int((1 - proxy_precision) * 500),
-            'fn': int((1 - proxy_recall) * 1000),
-            'coord_loss': avg_coord_loss,
-            'conf_loss': avg_conf_loss,
-            'class_loss': avg_class_loss
-        }
+        # Add loss components
+        metrics['coord_loss'] = avg_coord_loss
+        metrics['conf_loss'] = avg_conf_loss
+        metrics['class_loss'] = avg_class_loss
+        
+        # Add confidence metrics (required by instructions.md)
+        import numpy as np
+        if all_confidences:
+            metrics['mean_confidence'] = float(np.mean(all_confidences))
+            metrics['frac_conf_07'] = float(sum(1 for c in all_confidences if c >= 0.7) / len(all_confidences))
+            metrics['total_detections'] = len(all_confidences)
+        else:
+            metrics['mean_confidence'] = 0.0
+            metrics['frac_conf_07'] = 0.0
+            metrics['total_detections'] = 0
         
         # Log to tensorboard
         self.writer.add_scalar('val/loss', avg_loss, epoch)
@@ -458,6 +659,8 @@ class Trainer:
         self.writer.add_scalar('val/precision', metrics['precision'], epoch)
         self.writer.add_scalar('val/recall', metrics['recall'], epoch)
         self.writer.add_scalar('val/f1', metrics['f1'], epoch)
+        self.writer.add_scalar('val/mean_confidence', metrics['mean_confidence'], epoch)
+        self.writer.add_scalar('val/frac_conf_07', metrics['frac_conf_07'], epoch)
         
         return avg_loss, metrics
     
@@ -485,8 +688,8 @@ class Trainer:
             # Validate
             val_loss, metrics = self.validate(epoch)
             
-            # Update scheduler
-            self.scheduler.step(val_loss)
+            # Update scheduler (CosineAnnealingLR steps per epoch, not per metric)
+            self.scheduler.step()
             
             # Save history
             self.history['train_loss'].append(train_loss)
@@ -502,6 +705,11 @@ class Trainer:
             print(f"  Val Loss: {val_loss:.4f}")
             print(f"  Precision: {metrics['precision']:.3f} | Recall: {metrics['recall']:.3f} | F1: {metrics['f1']:.3f}")
             print(f"  TP: {metrics['tp']} | FP: {metrics['fp']} | FN: {metrics['fn']}")
+            # Print confidence metrics
+            if metrics.get('mean_confidence', 0) > 0:
+                print(f"  Mean Confidence: {metrics['mean_confidence']:.3f}")
+                print(f"  Detections >= 0.7 conf: {metrics['frac_conf_07']*100:.1f}%")
+            print(f"  Total Detections: {metrics.get('total_detections', 0)}")
             
             # Save checkpoint after each epoch
             epoch_checkpoint = f'yolo_epoch_{epoch+1}.pth'
