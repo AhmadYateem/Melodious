@@ -13,7 +13,7 @@ from typing import List, Dict, Tuple
 from PIL import Image
 
 from .model import YOLODetector
-from .dataset import TARGET_CLASSES
+from .dataset import CLASS_NAMES
 
 
 # Colors for visualization (BGR format for OpenCV)
@@ -37,7 +37,7 @@ def load_model(checkpoint_path: str, device: str = 'cuda') -> YOLODetector:
     """
     from .model import create_yolo_model
     
-    model = create_yolo_model(num_classes=len(TARGET_CLASSES), device=device)
+    model = create_yolo_model(num_classes=len(CLASS_NAMES), device=device)
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -128,8 +128,8 @@ def draw_detections(
         y2 = max(0, min(y2, h))
         
         # Get class name and color
-        label_idx = label.item()
-        class_name = TARGET_CLASSES[label_idx] if label_idx < len(TARGET_CLASSES) else f"class_{label_idx}"
+        label_idx = int(label.item())
+        class_name = CLASS_NAMES[label_idx] if 0 <= label_idx < len(CLASS_NAMES) else f"class_{label_idx}"
         color = COLORS[label_idx % len(COLORS)]
         
         # Draw box

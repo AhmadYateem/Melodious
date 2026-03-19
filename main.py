@@ -14,6 +14,12 @@ from melodious.train import Trainer
 
 
 def main():
+    """
+    CLI entrypoint that wires together dataloaders, model creation,
+    and the training loop (see `melodious/train.py:Trainer`).
+
+    Keep flags minimal and consistent with README quick commands.
+    """
     parser = argparse.ArgumentParser(description='Train Melodious music notation detector')
     parser.add_argument('--dataset', type=str, default='dataset_ds2_dense',
                        help='Path to dataset directory')
