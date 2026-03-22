@@ -1,0 +1,17 @@
+{
+  "0": "notehead-full",
+  "1": "notehead-half",
+  "2": "notehead-whole",
+  "3": "clefG",
+  "4": "clefF",
+  "5": "clefC",
+  "6": "rest-8th",
+  "7": "rest-quarter",
+  "8": "rest-half",
+  "9": "rest-whole",
+  "10": "accidentalSharp",
+  "11": "accidentalFlat",
+  "12": "accidentalNatural",
+  "13": "beam",
+  "14": "stem"
+}
