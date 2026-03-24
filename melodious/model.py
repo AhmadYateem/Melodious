@@ -195,6 +195,115 @@ class YOLODetector(nn.Module):
         
         return pred_large, pred_medium, pred_small
     
+    def get_detections(self, preds, conf_thresh: float = 0.3, img_size: int = 640):
+        """
+        Get detections from raw model predictions (for training/validation).
+        
+        Args:
+            preds: Raw predictions from forward pass
+            conf_thresh: Confidence threshold
+            img_size: Target image size for scaling coordinates
+        
+        Returns:
+            List of detections per image with boxes in pixel coordinates [x1,y1,x2,y2]
+        """
+        batch_size = preds[0].size(0)
+        all_detections = []
+        
+        for b in range(batch_size):
+            boxes = []
+            scores = []
+            labels = []
+            
+            for pred in preds:
+                # Extract predictions for this image
+                # pred shape: (num_anchors, H, W, 5 + num_classes)
+                p = pred[b]
+                num_anchors, grid_h, grid_w, _ = p.shape
+                
+                # Create grid offsets for this scale
+                grid_y, grid_x = torch.meshgrid(
+                    torch.arange(grid_h, device=p.device, dtype=p.dtype),
+                    torch.arange(grid_w, device=p.device, dtype=p.dtype),
+                    indexing='ij'
+                )
+                # Grid shape: (H, W) - need to broadcast with (num_anchors, H, W)
+                grid_x = grid_x.unsqueeze(0)  # (1, H, W)
+                grid_y = grid_y.unsqueeze(0)  # (1, H, W)
+                
+                # Get objectness and class scores
+                obj_conf = torch.sigmoid(p[..., 4:5])  # (num_anchors, H, W, 1)
+                class_probs = torch.softmax(p[..., 5:], dim=-1)  # (num_anchors, H, W, num_classes)
+                class_conf, class_pred = torch.max(class_probs, dim=-1, keepdim=True)
+                
+                # Combine confidences
+                conf = obj_conf * class_conf  # (num_anchors, H, W, 1)
+                
+                # Filter by confidence
+                mask = (conf > conf_thresh).squeeze(-1)  # (num_anchors, H, W)
+                
+                if mask.sum() > 0:
+                    # Get raw predictions for coordinates
+                    # tx, ty are offsets from grid cell (sigmoid to get 0-1 offset within cell)
+                    # tw, th are log-scaled width/height
+                    tx = torch.sigmoid(p[..., 0])  # (num_anchors, H, W)
+                    ty = torch.sigmoid(p[..., 1])
+                    tw = p[..., 2].clamp(max=5)  # Clamp to prevent overflow
+                    th = p[..., 3].clamp(max=5)
+                    
+                    # Apply grid offsets - grid broadcasts from (1, H, W) to (num_anchors, H, W)
+                    bx = tx + grid_x.float()  # (num_anchors, H, W)
+                    by = ty + grid_y.float()  # (num_anchors, H, W)
+                    
+                    # Width and height are encoded as log fractions of the resized image.
+                    bw = torch.exp(tw).clamp(max=float(img_size))
+                    bh = torch.exp(th).clamp(max=float(img_size))
+                    
+                    # Convert to pixel coordinates
+                    stride_x = img_size / grid_w
+                    stride_y = img_size / grid_h
+                    
+                    # Center in pixels
+                    cx = bx * stride_x
+                    cy = by * stride_y
+                    pw = (bw * img_size).clamp(max=float(img_size))
+                    ph = (bh * img_size).clamp(max=float(img_size))
+                    
+                    # Convert to xyxy format
+                    x1 = (cx - pw / 2)[mask]
+                    y1 = (cy - ph / 2)[mask]
+                    x2 = (cx + pw / 2)[mask]
+                    y2 = (cy + ph / 2)[mask]
+                    
+                    # Clamp to image bounds
+                    x1 = x1.clamp(0, img_size)
+                    y1 = y1.clamp(0, img_size)
+                    x2 = x2.clamp(0, img_size)
+                    y2 = y2.clamp(0, img_size)
+                    
+                    boxes_filtered = torch.stack([x1, y1, x2, y2], dim=-1)
+                    scores_filtered = conf[mask].squeeze(-1)
+                    labels_filtered = class_pred[mask].squeeze(-1)
+                    
+                    boxes.append(boxes_filtered)
+                    scores.append(scores_filtered)
+                    labels.append(labels_filtered)
+            
+            if len(boxes) > 0:
+                all_detections.append({
+                    'boxes': torch.cat(boxes, dim=0),
+                    'scores': torch.cat(scores, dim=0),
+                    'labels': torch.cat(labels, dim=0).long()
+                })
+            else:
+                all_detections.append({
+                    'boxes': torch.zeros((0, 4), device=preds[0].device),
+                    'scores': torch.zeros((0,), device=preds[0].device),
+                    'labels': torch.zeros((0,), device=preds[0].device, dtype=torch.long)
+                })
+        
+        return all_detections
+    
     def predict(self, x, conf_thresh: float = 0.5, iou_thresh: float = 0.45):
         """
         Run inference and post-process predictions.
@@ -211,10 +320,10 @@ class YOLODetector(nn.Module):
         with torch.no_grad():
             pred_large, pred_medium, pred_small = self.forward(x)
             
-            # Combine predictions from all scales
-            predictions = self._decode_predictions(
+            predictions = self.get_detections(
                 [pred_large, pred_medium, pred_small],
-                conf_thresh=conf_thresh
+                conf_thresh=conf_thresh,
+                img_size=x.shape[-1]
             )
             
             # Apply NMS
