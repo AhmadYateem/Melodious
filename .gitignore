@@ -10,3 +10,5 @@ __pycache__/
 # Ignore Jupyter notebook checkpoints
 .ipynb_checkpoints/
 dataset_ds2_dense/
+Ahmad_Instructions.md
+Ahmad_Documentation.md
