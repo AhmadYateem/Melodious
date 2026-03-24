@@ -1,0 +1,12 @@
+{
+  "image_path": "dataset_ds2_dense\\images\\lg-101766503886095953-aug-beethoven--page-1.png",
+  "image_size": {
+    "width": 1960,
+    "height": 2772
+  },
+  "model": {
+    "type": "custom-yolo",
+    "checkpoint": "outputs\\meeting_run\\yolo_scratch_best.pth"
+  },
+  "detections": []
+}
